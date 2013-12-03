@@ -13,12 +13,14 @@ function TinyPass() {
   this.renderables=[];
   this.rendertarget=null;
   this.onDraw = function() {};
+  this.customDraw = function() {};
 }
-function TinyWGL(canvas,zfar) {
+function TinyWGL(canvas,zfar,yfov) {
   // Attempt to initialize WebGL
   var gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
   this.gl = gl; // always assign this so we can check if it's bogus because constructors can't fail
   if(!gl) return null;
+  if(!yfov) yfov=60;
   
   // Set up function calls
   this.createShader = createShader;
@@ -32,6 +34,7 @@ function TinyWGL(canvas,zfar) {
   this.defaultTexLoad = defaultTexLoad;
   this.pow2TexLoad = pow2TexLoad;
   this.createRenderTarget=createRenderTarget;
+  this.render = tinywgl_render;
   this.needredraw = false;
   this.Mat4x4 = function(v,x) { gl.uniformMatrix4fv(v, false, new Float32Array(x.flatten())); };
   this.Float1 = function(v,x) { gl.uniform1f(v,x); };
@@ -84,8 +87,9 @@ function TinyWGL(canvas,zfar) {
     ref.canvaswidth=canvas.width=window.innerWidth;
     ref.canvasheight=canvas.height=window.innerHeight;
     gl.viewport(0, 0, canvas.width, canvas.height);
-    ref.perspectiveMatrix = makePerspective(45, canvas.width/canvas.height, 0.1, zfar);
+    ref.perspectiveMatrix = makePerspective(yfov, canvas.width/canvas.height, 0.1, zfar);
     ref.needredraw=true;
+    ref.hfov=2*Math.atan(Math.tan(yfov*Math.PI/360)*canvas.width/canvas.height);
   };
   addEvent(window,"resize", on_resize);
   
@@ -99,6 +103,18 @@ function TinyWGL(canvas,zfar) {
   })();
     
   on_resize({});
+}
+function tinywgl_render(r) {
+  var gl = this.gl;
+  for(var p in r.shader.props) {
+    r.shader.props[p](r.shader.propLoc[p],r.params[p])
+  }
+  if(!r.indices) {
+    gl.drawArrays(r.type, 0, r.count);
+  } else {
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, r.indices);
+    gl.drawElements(r.type, r.count, gl.UNSIGNED_SHORT, 0);
+  }
 }
 function createShader(ps,vs, props, attributes) {
   var gl = this.gl;
@@ -116,6 +132,14 @@ function createShader(ps,vs, props, attributes) {
   
   shaderProgram.props=props;
   shaderProgram.attributes=attributes;
+  for(var i = 0; i < shaderProgram.attributes.length; i++) {
+    shaderProgram.attributes[i][0] = gl.getAttribLocation(shaderProgram, shaderProgram.attributes[i][0]);
+    gl.enableVertexAttribArray(shaderProgram.attributes[i][0]);  
+  }
+  shaderProgram.propLoc={};
+  for(var p in shaderProgram.props) {
+    shaderProgram.propLoc[p]=gl.getUniformLocation(shaderProgram, p);
+  }
   
   return shaderProgram;
 };
@@ -224,16 +248,18 @@ function createIndexBuffer(indices) {
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, r);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
   return r;
-}  
+} 
+var tinywgl__lastshader=null; 
+var tinywgl__lastarraybuffer=null;
 function applyShader(shader,buffer) {
   var gl = this.gl;
-  gl.useProgram(shader);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  if(shader!=tinywgl__lastshader)
+    gl.useProgram(tinywgl__lastshader=shader);
+  if(buffer!=tinywgl__lastarraybuffer)
+    gl.bindBuffer(gl.ARRAY_BUFFER, tinywgl__lastarraybuffer=buffer);
   for(var i = 0; i < shader.attributes.length; i++) {
     var attr = shader.attributes[i];
-    var loc = gl.getAttribLocation(shader, attr[0]);
-    gl.enableVertexAttribArray(loc);  
-    gl.vertexAttribPointer(loc, attr[1], gl.FLOAT, false, attr[2], attr[3]);  
+    gl.vertexAttribPointer(attr[0], attr[1], gl.FLOAT, false, attr[2], attr[3]);  
   }
 }
 function draw() {
@@ -255,27 +281,18 @@ function draw() {
     pass.onDraw();
     this.perspectiveCameraMatrix = this.perspectiveMatrix.x(pass.cameraMatrix);
     gl.bindFramebuffer(gl.FRAMEBUFFER, pass.rendertarget);
+    pass.customDraw();
     
     for(var i = 0; i < pass.renderables.length; i++) {
       var r = pass.renderables[i];
-      r.render(this);
-      
-      this.applyShader(r.shader,r.verts);
-  
-      for(var p in r.shader.props) {
-        var uniform = gl.getUniformLocation(r.shader, p);
-        r.shader.props[p](uniform,r.params[p])
-      }
-      if(!r.indices) {
-        gl.drawArrays(r.type, 0, r.count);
-      } else {
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, r.indices);
-        gl.drawElements(r.type, r.count, gl.UNSIGNED_SHORT, 0);
+      if(!r.render(this)) {
+        tinywgl.applyShader(r.shader,r.verts);
+        tinywgl.render(r);
       }
     }
   }
 }
-function TinyImage(path,tinywgl,shader) {
+function TinyImage(path,tinywgl,shader,pow2) {
   if(typeof path === 'string') path = [path];
   if(!shader) shader = tinywgl.imgShader;
   
@@ -284,7 +301,7 @@ function TinyImage(path,tinywgl,shader) {
   this.indices = tinywgl.imgIndices;
   this.params={"ModelMat" : Matrix.I(4)};
   for(var i = 0; i < path.length; ++i) {
-    this.params["s"+i] = tinywgl.loadTexture(path[i],i);
+    this.params["s"+i] = tinywgl.loadTexture(path[i],!pow2?0:function(img,tex){tinywgl.pow2TexLoad(img,tex);});
   }
   
   this.shader = shader;
@@ -307,5 +324,5 @@ function FullScreenQuad(tex,tinywgl) {
   this.params={"PMat" : Matrix.I(4), "ModelMat" : Matrix.I(4), "s0" : tex };   
   this.shader = tinywgl.imgShader;
   this.type = tinywgl.gl.TRIANGLES;
-  this.render = function(wgl) { };
+  this.render = function() {};
 }
